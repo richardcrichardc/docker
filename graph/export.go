@@ -10,7 +10,6 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/engine"
 	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/registry"
 )
 
@@ -30,59 +29,44 @@ func (s *TagStore) CmdImageExport(job *engine.Job) engine.Status {
 	}
 	defer os.RemoveAll(tempdir)
 
-	rootRepoMap := map[string]Repository{}
-	addKey := func(name string, tag string, id string) {
-		log.Debugf("add key [%s:%s]", name, tag)
-		if repo, ok := rootRepoMap[name]; !ok {
-			rootRepoMap[name] = Repository{tag: id}
-		} else {
-			repo[tag] = id
-		}
-	}
+	repoMap := map[string]Repository{}
+
 	for _, name := range job.Args {
 		name = registry.NormalizeLocalName(name)
 		log.Debugf("Serializing %s", name)
 		rootRepo := s.Repositories[name]
 		if rootRepo != nil {
 			// this is a base repo name, like 'busybox'
-			for tag, id := range rootRepo {
-				addKey(name, tag, id)
-				if err := s.exportImage(job.Eng, id, tempdir); err != nil {
+			for _, id := range rootRepo {
+				if err := s.exportImage(job.Eng, id, tempdir, repoMap); err != nil {
 					return job.Error(err)
 				}
 			}
 		} else {
+			// This is a named image like 'busybox:latest'
 			img, err := s.LookupImage(name)
 			if err != nil {
 				return job.Error(err)
 			}
-
 			if img != nil {
-				// This is a named image like 'busybox:latest'
-				repoName, repoTag := parsers.ParseRepositoryTag(name)
-
-				// check this length, because a lookup of a truncated has will not have a tag
-				// and will not need to be added to this map
-				if len(repoTag) > 0 {
-					addKey(repoName, repoTag, img.ID)
-				}
-				if err := s.exportImage(job.Eng, img.ID, tempdir); err != nil {
+				if err := s.exportImage(job.Eng, img.ID, tempdir, repoMap); err != nil {
 					return job.Error(err)
 				}
 
 			} else {
 				// this must be an ID that didn't get looked up just right?
-				if err := s.exportImage(job.Eng, name, tempdir); err != nil {
+				if err := s.exportImage(job.Eng, name, tempdir, repoMap); err != nil {
 					return job.Error(err)
 				}
 			}
 		}
 		log.Debugf("End Serializing %s", name)
 	}
+
 	// write repositories, if there is something to write
-	if len(rootRepoMap) > 0 {
-		rootRepoJson, _ := json.Marshal(rootRepoMap)
-		if err := ioutil.WriteFile(path.Join(tempdir, "repositories"), rootRepoJson, os.FileMode(0644)); err != nil {
+	if len(repoMap) > 0 {
+		repoJSON, _ := json.MarshalIndent(repoMap, "", "  ")
+		if err := ioutil.WriteFile(path.Join(tempdir, "repositories"), repoJSON, os.FileMode(0644)); err != nil {
 			return job.Error(err)
 		}
 	} else {
@@ -103,7 +87,7 @@ func (s *TagStore) CmdImageExport(job *engine.Job) engine.Status {
 }
 
 // FIXME: this should be a top-level function, not a class method
-func (s *TagStore) exportImage(eng *engine.Engine, name, tempdir string) error {
+func (s *TagStore) exportImage(eng *engine.Engine, name, tempdir string, repoMap map[string]Repository) error {
 	for n := name; n != ""; {
 		// temporary directory
 		tmpImageDir := path.Join(tempdir, n)
@@ -142,6 +126,19 @@ func (s *TagStore) exportImage(eng *engine.Engine, name, tempdir string) error {
 		job.Stdout.Add(fsTar)
 		if err := job.Run(); err != nil {
 			return err
+		}
+
+		log.Debugf("Serialised layer: %s", n)
+		for repoName, repo := range s.Repositories {
+			for tag, id := range repo {
+				if id == n {
+					if repo, ok := repoMap[repoName]; !ok {
+						repoMap[repoName] = Repository{tag: id}
+					} else {
+						repo[tag] = id
+					}
+				}
+			}
 		}
 
 		// find parent
